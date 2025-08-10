@@ -1,0 +1,27 @@
+syntax = "proto3";
+package btspeak_key_interceptor;
+
+message Empty {}
+message BrailleKeyCombination {
+  int32 dots = 1;
+  bool space = 2;
+}
+message BrailleKeyCombinations {
+  repeated BrailleKeyCombination combinations = 1;
+}
+message BrailleKeyEvent {
+  int32 dot = 1;
+  bool release = 2;
+}
+message BrailleKeyEvents {
+  repeated BrailleKeyEvent events = 1;
+}
+service BtspeakKeyInterceptor {
+  rpc GrabKeyCombinations(Empty) returns (stream BrailleKeyCombination);
+  rpc GrabKeyEvents(Empty) returns (stream BrailleKeyEvent);
+  rpc SetExcludedKeyCombinations(BrailleKeyCombinations) returns (Empty);
+  rpc SetExcludedKeyEvents(BrailleKeyEvents) returns (Empty);
+  rpc ReleaseKeyboard(Empty) returns (Empty);
+  rpc SendKeyCombination(BrailleKeyCombination) returns (Empty);
+  rpc SendKeyEvent(BrailleKeyEvent) returns (Empty);
+}
