@@ -1,5 +1,5 @@
 [package]
-name = "btspeak-keyboard-interceptor"
+name = "btspeak-key-interceptor"
 version = "0.1.0"
 edition = "2024"
 
