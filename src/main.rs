@@ -1,6 +1,7 @@
 use evdev::{enumerate, EventSummary};
 use evdev::uinput::VirtualDevice;
-fn main() {
+#[tokio::main]
+async fn main() {
   let mut device = enumerate()
     .find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille"))
     .unwrap()
@@ -13,8 +14,9 @@ fn main() {
     .unwrap()
     .build()
     .unwrap();
+  let mut event_stream = device.into_event_stream().unwrap();
   loop {
-    for event in device.fetch_events().unwrap() {
+    while let Ok(event) = event_stream.next_event().await {
       match event.destructure() {
         EventSummary::Key(_, code, value) => {
           println!("Key {:?}, value {}", code, value);
