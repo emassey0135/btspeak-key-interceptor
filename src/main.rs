@@ -1,5 +1,6 @@
 use bitflags::{bitflags, Flags};
 use evdev::{enumerate, EventSummary, KeyCode};
+use evdev::event_variants::KeyEvent;
 use evdev::uinput::VirtualDevice;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -35,14 +36,16 @@ struct State {
 struct MyServer {
   state: Arc<Mutex<State>>,
   combination_rx: Arc<Mutex<mpsc::Receiver<KeyFlags>>>,
-  combination_sender: Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>,
+  combination_sender: Arc<Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>>,
   event_rx: Arc<Mutex<mpsc::Receiver<(KeyFlags, bool)>>>,
-  event_sender: Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>,
+  event_sender: Arc<Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>>,
+  combination_tx: mpsc::Sender<KeyFlags>,
+  event_tx: mpsc::Sender<(KeyFlags, bool)>,
 }
 #[tonic::async_trait]
 impl BtspeakKeyInterceptor for MyServer {
   type GrabKeyCombinationsStream = ReceiverStream<Result<BrailleKeyCombination, Status>>;
-  async fn grab_key_combinations(&self, request: Request<Empty>) -> Result<Response<Self::GrabKeyCombinationsStream>, Status> {
+  async fn grab_key_combinations(&self, _request: Request<Empty>) -> Result<Response<Self::GrabKeyCombinationsStream>, Status> {
     let combination_sender = self.combination_sender.lock().await;
     self.state.lock().await.sending_key_combinations = true;
     let (tx, rx) = mpsc::channel(32);
@@ -50,6 +53,7 @@ impl BtspeakKeyInterceptor for MyServer {
     let canceller = CancellationToken::new();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     combination_sender.set(Some((canceller.clone(), cancel_rx)));
+    let combination_sender = self.combination_sender.clone();
     tokio::spawn(async move {
       loop {
         let mut combination_rx = combination_rx.lock().await;
@@ -64,10 +68,16 @@ impl BtspeakKeyInterceptor for MyServer {
                 let dots = (combination.clone() - KeyFlags::Space).bits();
                 let space = combination.contains(KeyFlags::Space);
                 let combination = BrailleKeyCombination { dots: dots as i32, space };
-                tx.send(Ok(combination)).await.unwrap();
+                match tx.send(Ok(combination)).await {
+                  Ok(_) => {},
+                  _ => {
+                    combination_sender.lock().await.set(None);
+                    break;
+                  },
+                };
               },
               None => {
-                cancel_tx.send(()).unwrap();
+                combination_sender.lock().await.set(None);
                 break;
               },
             };
@@ -78,7 +88,7 @@ impl BtspeakKeyInterceptor for MyServer {
     Ok(Response::new(ReceiverStream::new(rx)))
   }
   type GrabKeyEventsStream = ReceiverStream<Result<BrailleKeyEvent, Status>>;
-  async fn grab_key_events(&self, request: Request<Empty>) -> Result<Response<Self::GrabKeyEventsStream>, Status> {
+  async fn grab_key_events(&self, _request: Request<Empty>) -> Result<Response<Self::GrabKeyEventsStream>, Status> {
     let event_sender = self.event_sender.lock().await;
     self.state.lock().await.sending_key_events = true;
     let (tx, rx) = mpsc::channel(32);
@@ -86,6 +96,7 @@ impl BtspeakKeyInterceptor for MyServer {
     let canceller = CancellationToken::new();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     event_sender.set(Some((canceller.clone(), cancel_rx)));
+    let event_sender = self.event_sender.clone();
     tokio::spawn(async move {
       loop {
         let mut event_rx = event_rx.lock().await;
@@ -100,10 +111,16 @@ impl BtspeakKeyInterceptor for MyServer {
                 let dot = event.0.bits();
                 let release = event.1;
                 let event = BrailleKeyEvent { dot: dot as i32, release };
-                tx.send(Ok(event)).await.unwrap();
+                match tx.send(Ok(event)).await {
+                  Ok(_) => {},
+                  _ => {
+                    event_sender.lock().await.set(None);
+                    break;
+                  },
+                };
               },
               None => {
-                cancel_tx.send(()).unwrap();
+                event_sender.lock().await.set(None);
                 break;
               },
             };
@@ -139,12 +156,33 @@ impl BtspeakKeyInterceptor for MyServer {
     Ok(Response::new(reply))
   }
   async fn send_key_combination(&self, request: Request<BrailleKeyCombination>) -> Result<Response<Empty>, Status> {
+    let combination = request.into_inner();
+    let combination = KeyFlags::from_bits_truncate(combination.dots as u16);
+    self.combination_tx.send(combination).await.unwrap();
     let reply = Empty {};
     Ok(Response::new(reply))
   }
   async fn send_key_event(&self, request: Request<BrailleKeyEvent>) -> Result<Response<Empty>, Status> {
+    let event = request.into_inner();
+    let key = KeyFlags::from_bits_truncate(event.dot as u16);
+    let event = (key, event.release);
+    self.event_tx.send(event).await.unwrap();
     let reply = Empty {};
     Ok(Response::new(reply))
+  }
+}
+fn key_flag_to_key_code(flag: KeyFlags) -> KeyCode {
+  match flag {
+    KeyFlags::Dot1 => KeyCode::KEY_BRL_DOT1,
+    KeyFlags::Dot2 => KeyCode::KEY_BRL_DOT2,
+    KeyFlags::Dot3 => KeyCode::KEY_BRL_DOT3,
+    KeyFlags::Dot4 => KeyCode::KEY_BRL_DOT4,
+    KeyFlags::Dot5 => KeyCode::KEY_BRL_DOT5,
+    KeyFlags::Dot6 => KeyCode::KEY_BRL_DOT6,
+    KeyFlags::Dot7 => KeyCode::KEY_BRL_DOT7,
+    KeyFlags::Dot8 => KeyCode::KEY_BRL_DOT8,
+    KeyFlags::Space => KeyCode::KEY_SPACE,
+    _ => panic!("Invalid key event"),
   }
 }
 #[tokio::main]
@@ -154,18 +192,22 @@ async fn main() {
     .unwrap()
     .1;
   device.grab().unwrap();
-  let mut virtual_device = VirtualDevice::builder()
+  let virtual_device = VirtualDevice::builder()
     .unwrap()
     .name("btspeak-key-interceptor")
     .with_keys(device.supported_keys().unwrap())
     .unwrap()
     .build()
     .unwrap();
+  let virtual_device = Arc::new(Mutex::new(virtual_device));
+  let virtual_device2 = virtual_device.clone();
   let mut event_stream = device.into_event_stream().unwrap();
   let state = Arc::new(Mutex::new(State { sending_key_combinations: false, sending_key_events: false }));
   let state2 = state.clone();
   let (combination_tx, combination_rx) = mpsc::channel(32);
   let (event_tx, event_rx) = mpsc::channel(32);
+  let (combination_tx2, mut combination_rx2) = mpsc::channel::<KeyFlags>(32);
+  let (event_tx2, mut event_rx2) = mpsc::channel::<(KeyFlags, bool)>(32);
   tokio::spawn(async move {
     let mut pressed_keys = KeyFlags::empty();
     let mut held_keys = KeyFlags::empty();
@@ -204,10 +246,49 @@ async fn main() {
             event_tx.send((flag.clone(), released)).await.unwrap();
           };
           if !state.sending_key_combinations && !state.sending_key_events {
-            virtual_device.emit(&[event]).unwrap();
+            virtual_device.lock().await.emit(&[event]).unwrap();
           };
         },
         _ => {}
+      };
+    };
+  });
+  tokio::spawn(async move {
+    loop {
+      select! {
+        result = combination_rx2.recv() => {
+          if let Some(combination) = result {
+            let codes = combination
+              .iter()
+              .map(|flag| key_flag_to_key_code(flag))
+              .collect::<Vec<KeyCode>>();
+            let mut virtual_device2 = virtual_device2.lock().await;
+            for code in codes.clone() {
+              virtual_device2.emit(&[KeyEvent::new(code, 1).into()]).unwrap();
+            };
+            for code in codes {
+              virtual_device2.emit(&[KeyEvent::new(code, 0).into()]).unwrap();
+            };
+          }
+          else {
+            break;
+          };
+        },
+        result = event_rx2.recv() => {
+          if let Some(event) = result {
+            let code = key_flag_to_key_code(event.0);
+            let value = if event.1 {
+              0
+            }
+            else {
+              1
+            };
+            virtual_device2.lock().await.emit(&[KeyEvent::new(code, value).into()]).unwrap();
+          }
+          else {
+            break;
+          };
+        },
       };
     };
   });
@@ -215,9 +296,11 @@ async fn main() {
   let server = MyServer {
     state: state2,
     combination_rx: Arc::new(Mutex::new(combination_rx)),
-    combination_sender: Mutex::new(Cell::new(None)),
+    combination_sender: Arc::new(Mutex::new(Cell::new(None))),
     event_rx: Arc::new(Mutex::new(event_rx)),
-    event_sender: Mutex::new(Cell::new(None)),
+    event_sender: Arc::new(Mutex::new(Cell::new(None))),
+    combination_tx: combination_tx2,
+    event_tx: event_tx2,
   };
   Server::builder()
     .add_service(BtspeakKeyInterceptorServer::new(server))
