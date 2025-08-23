@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bitflags = { version = "2.9.2", features = ["std"] }
+bitflags = { version = "2.9.3", features = ["std"] }
 evdev = { version = "0.13.1", features = ["tokio"] }
 prost = "0.14.1"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["full"] }
 tonic = "0.14.1"
 tonic-prost = "0.14.1"
 

@@ -1,9 +1,12 @@
 use bitflags::{bitflags, Flags};
 use evdev::{enumerate, EventSummary, KeyCode};
 use evdev::uinput::VirtualDevice;
+use std::cell::Cell;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::select;
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Request, Response, Status};
 use btspeak_key_interceptor::btspeak_key_interceptor_server::{BtspeakKeyInterceptor, BtspeakKeyInterceptorServer};
 use btspeak_key_interceptor::{Empty, BrailleKeyCombination, BrailleKeyCombinations, BrailleKeyEvent, BrailleKeyEvents};
@@ -29,40 +32,83 @@ struct State {
   sending_key_combinations: bool,
   sending_key_events: bool,
 }
-#[derive(Debug)]
 struct MyServer {
   state: Arc<Mutex<State>>,
   combination_rx: Arc<Mutex<mpsc::Receiver<KeyFlags>>>,
+  combination_sender: Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>,
   event_rx: Arc<Mutex<mpsc::Receiver<(KeyFlags, bool)>>>,
+  event_sender: Mutex<Cell<Option<(CancellationToken, oneshot::Receiver<()>)>>>,
 }
 #[tonic::async_trait]
 impl BtspeakKeyInterceptor for MyServer {
   type GrabKeyCombinationsStream = ReceiverStream<Result<BrailleKeyCombination, Status>>;
   async fn grab_key_combinations(&self, request: Request<Empty>) -> Result<Response<Self::GrabKeyCombinationsStream>, Status> {
+    let combination_sender = self.combination_sender.lock().await;
     self.state.lock().await.sending_key_combinations = true;
     let (tx, rx) = mpsc::channel(32);
     let combination_rx = self.combination_rx.clone();
+    let canceller = CancellationToken::new();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    combination_sender.set(Some((canceller.clone(), cancel_rx)));
     tokio::spawn(async move {
-      while let Some(combination) = combination_rx.lock().await.recv().await {
-        let dots = (combination.clone() - KeyFlags::Space).bits();
-        let space = combination.contains(KeyFlags::Space);
-        let combination = BrailleKeyCombination { dots: dots as i32, space };
-        tx.send(Ok(combination)).await.unwrap();
+      loop {
+        let mut combination_rx = combination_rx.lock().await;
+        select! {
+          _ = canceller.cancelled() => {
+            cancel_tx.send(()).unwrap();
+            break;
+          },
+          result = combination_rx.recv() => {
+            match result {
+              Some(combination) => {
+                let dots = (combination.clone() - KeyFlags::Space).bits();
+                let space = combination.contains(KeyFlags::Space);
+                let combination = BrailleKeyCombination { dots: dots as i32, space };
+                tx.send(Ok(combination)).await.unwrap();
+              },
+              None => {
+                cancel_tx.send(()).unwrap();
+                break;
+              },
+            };
+          },
+        };
       };
     });
     Ok(Response::new(ReceiverStream::new(rx)))
   }
   type GrabKeyEventsStream = ReceiverStream<Result<BrailleKeyEvent, Status>>;
   async fn grab_key_events(&self, request: Request<Empty>) -> Result<Response<Self::GrabKeyEventsStream>, Status> {
+    let event_sender = self.event_sender.lock().await;
     self.state.lock().await.sending_key_events = true;
     let (tx, rx) = mpsc::channel(32);
     let event_rx = self.event_rx.clone();
+    let canceller = CancellationToken::new();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    event_sender.set(Some((canceller.clone(), cancel_rx)));
     tokio::spawn(async move {
-      while let Some(event) = event_rx.lock().await.recv().await {
-        let dot = event.0.bits();
-        let release = event.1;
-        let event = BrailleKeyEvent { dot: dot as i32, release };
-        tx.send(Ok(event)).await.unwrap();
+      loop {
+        let mut event_rx = event_rx.lock().await;
+        select! {
+          _ = canceller.cancelled() => {
+            cancel_tx.send(()).unwrap();
+            break;
+          },
+          result = event_rx.recv() => {
+            match result {
+              Some(event) => {
+                let dot = event.0.bits();
+                let release = event.1;
+                let event = BrailleKeyEvent { dot: dot as i32, release };
+                tx.send(Ok(event)).await.unwrap();
+              },
+              None => {
+                cancel_tx.send(()).unwrap();
+                break;
+              },
+            };
+          },
+        };
       };
     });
     Ok(Response::new(ReceiverStream::new(rx)))
@@ -77,6 +123,16 @@ impl BtspeakKeyInterceptor for MyServer {
   }
   async fn release_keyboard(&self, _request: Request<Empty>) -> Result<Response<Empty>, Status> {
     let mut state = self.state.lock().await;
+    let combination_sender = self.combination_sender.lock().await;
+    let event_sender = self.event_sender.lock().await;
+    if let Some((canceller, cancel_rx)) = combination_sender.take() {
+      canceller.cancel();
+      cancel_rx.await.unwrap();
+    };
+    if let Some((canceller, cancel_rx)) = event_sender.take() {
+      canceller.cancel();
+      cancel_rx.await.unwrap();
+    };
     state.sending_key_combinations = false;
     state.sending_key_events = false;
     let reply = Empty {};
@@ -156,9 +212,13 @@ async fn main() {
     };
   });
   let addr = "127.0.0.1:54123".parse().unwrap();
-  let combination_rx = Arc::new(Mutex::new(combination_rx));
-  let event_rx = Arc::new(Mutex::new(event_rx));
-  let server = MyServer { state: state2, combination_rx, event_rx };
+  let server = MyServer {
+    state: state2,
+    combination_rx: Arc::new(Mutex::new(combination_rx)),
+    combination_sender: Mutex::new(Cell::new(None)),
+    event_rx: Arc::new(Mutex::new(event_rx)),
+    event_sender: Mutex::new(Cell::new(None)),
+  };
   Server::builder()
     .add_service(BtspeakKeyInterceptorServer::new(server))
     .serve(addr)
