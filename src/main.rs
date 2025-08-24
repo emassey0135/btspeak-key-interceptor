@@ -1,11 +1,12 @@
 use bitflags::{bitflags, Flags};
-use evdev::{enumerate, EventSummary, KeyCode};
+use evdev::{AttributeSet, enumerate, EventSummary, KeyCode};
 use evdev::event_variants::KeyEvent;
 use evdev::uinput::VirtualDevice;
 use std::cell::Cell;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::{mpsc, Mutex, oneshot};
+use tokio::time::{Duration, sleep};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Request, Response, Status};
@@ -255,21 +256,28 @@ fn key_flag_to_key_code(flag: KeyFlags) -> KeyCode {
 }
 #[tokio::main]
 async fn main() {
-  let mut device = enumerate()
-    .find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille"))
-    .unwrap()
-    .1;
-  device.grab().unwrap();
+  let keys = vec!(
+    KeyCode::KEY_BRL_DOT1,
+    KeyCode::KEY_BRL_DOT2,
+    KeyCode::KEY_BRL_DOT3,
+    KeyCode::KEY_BRL_DOT4,
+    KeyCode::KEY_BRL_DOT5,
+    KeyCode::KEY_BRL_DOT6,
+    KeyCode::KEY_BRL_DOT7,
+    KeyCode::KEY_BRL_DOT8,
+    KeyCode::KEY_SPACE,
+  )
+  .into_iter()
+  .collect::<AttributeSet<KeyCode>>();
   let virtual_device = VirtualDevice::builder()
     .unwrap()
     .name("btspeak-key-interceptor")
-    .with_keys(device.supported_keys().unwrap())
+    .with_keys(&keys)
     .unwrap()
     .build()
     .unwrap();
   let virtual_device = Arc::new(Mutex::new(virtual_device));
   let virtual_device2 = virtual_device.clone();
-  let mut event_stream = device.into_event_stream().unwrap();
   let state = Arc::new(Mutex::new(State {
     sending_key_combinations: false,
     sending_key_events: false,
@@ -282,11 +290,18 @@ async fn main() {
   let (combination_tx2, mut combination_rx2) = mpsc::channel::<KeyFlags>(32);
   let (event_tx2, mut event_rx2) = mpsc::channel::<(KeyFlags, bool)>(32);
   tokio::spawn(async move {
+    let mut device = enumerate()
+      .find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille"))
+      .unwrap()
+      .1;
+    device.grab().unwrap();
+    let mut event_stream = device.into_event_stream().unwrap();
     let mut pressed_keys = KeyFlags::empty();
     let mut held_keys = KeyFlags::empty();
-    while let Ok(event) = event_stream.next_event().await {
-      match event.destructure() {
-        EventSummary::Key(_, code, value) => {
+    loop {
+      let event = event_stream.next_event().await;
+      match event.map(|event| event.destructure()) {
+        Ok(EventSummary::Key(_, code, value)) => {
           let flag = match code {
             KeyCode::KEY_BRL_DOT1 => KeyFlags::Dot1,
             KeyCode::KEY_BRL_DOT2 => KeyFlags::Dot2,
@@ -301,7 +316,7 @@ async fn main() {
           };
           let state = state.lock().await;
           if state.sending_key_events && state.excluded_key_events.contains(&(flag.clone(), value==0)) {
-            virtual_device.lock().await.emit(&[event]).unwrap();
+            virtual_device.lock().await.emit(&[KeyEvent::new(code, value).into()]).unwrap();
           }
           else {
             match value {
@@ -337,11 +352,26 @@ async fn main() {
               event_tx.send((flag.clone(), released)).await.unwrap();
             };
             if !state.sending_key_combinations && !state.sending_key_events {
-              virtual_device.lock().await.emit(&[event]).unwrap();
+              virtual_device.lock().await.emit(&[KeyEvent::new(code, value).into()]).unwrap();
             };
           };
         },
-        _ => {}
+        Err(_) => {
+          loop {
+    match enumerate().find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille")) {
+      Some((_, device2)) => {
+        device = device2;
+        device.grab().unwrap();
+        event_stream = device.into_event_stream().unwrap();
+        break;
+      },
+      None => {
+        sleep(Duration::from_millis(100)).await;
+      },
+    };
+          };
+        },
+        Ok(_) => {},
       };
     };
   });
