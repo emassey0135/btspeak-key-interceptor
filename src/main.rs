@@ -290,10 +290,16 @@ async fn main() {
   let (combination_tx2, mut combination_rx2) = mpsc::channel::<KeyFlags>(32);
   let (event_tx2, mut event_rx2) = mpsc::channel::<(KeyFlags, bool)>(32);
   tokio::spawn(async move {
-    let mut device = enumerate()
-      .find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille"))
-      .unwrap()
-      .1;
+    let mut device = loop {
+      match enumerate().find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille")) {
+        Some((_, device)) => {
+          break device;
+        },
+        None => {
+          sleep(Duration::from_millis(100)).await;
+        },
+      };
+    };
     device.grab().unwrap();
     let mut event_stream = device.into_event_stream().unwrap();
     let mut pressed_keys = KeyFlags::empty();
@@ -358,17 +364,17 @@ async fn main() {
         },
         Err(_) => {
           loop {
-    match enumerate().find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille")) {
-      Some((_, device2)) => {
-        device = device2;
-        device.grab().unwrap();
-        event_stream = device.into_event_stream().unwrap();
-        break;
-      },
-      None => {
-        sleep(Duration::from_millis(100)).await;
-      },
-    };
+            match enumerate().find(|(_, device)| device.name().map_or(false, |name| name=="4x3braille")) {
+              Some((_, device2)) => {
+                device = device2;
+                device.grab().unwrap();
+                event_stream = device.into_event_stream().unwrap();
+                break;
+              },
+              None => {
+                sleep(Duration::from_millis(100)).await;
+              },
+            };
           };
         },
         Ok(_) => {},
