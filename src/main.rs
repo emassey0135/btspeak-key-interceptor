@@ -32,6 +32,8 @@ bitflags! {
 struct State {
   sending_key_combinations: bool,
   sending_key_events: bool,
+  excluded_key_combinations: Vec<KeyFlags>,
+  excluded_key_events: Vec<(KeyFlags, bool)>,
 }
 struct MyServer {
   state: Arc<Mutex<State>>,
@@ -53,12 +55,14 @@ impl BtspeakKeyInterceptor for MyServer {
     let canceller = CancellationToken::new();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     combination_sender.set(Some((canceller.clone(), cancel_rx)));
+    let state = self.state.clone();
     let combination_sender = self.combination_sender.clone();
     tokio::spawn(async move {
       loop {
         let mut combination_rx = combination_rx.lock().await;
         select! {
           _ = canceller.cancelled() => {
+            state.lock().await.excluded_key_combinations = vec!();
             cancel_tx.send(()).unwrap();
             break;
           },
@@ -71,12 +75,18 @@ impl BtspeakKeyInterceptor for MyServer {
                 match tx.send(Ok(combination)).await {
                   Ok(_) => {},
                   _ => {
+                    let mut state = state.lock().await;
+                    state.sending_key_combinations = false;
+                    state.excluded_key_combinations = vec!();
                     combination_sender.lock().await.set(None);
                     break;
                   },
                 };
               },
               None => {
+                let mut state = state.lock().await;
+                state.sending_key_combinations = false;
+                state.excluded_key_combinations = vec!();
                 combination_sender.lock().await.set(None);
                 break;
               },
@@ -97,11 +107,13 @@ impl BtspeakKeyInterceptor for MyServer {
     let (cancel_tx, cancel_rx) = oneshot::channel();
     event_sender.set(Some((canceller.clone(), cancel_rx)));
     let event_sender = self.event_sender.clone();
+    let state = self.state.clone();
     tokio::spawn(async move {
       loop {
         let mut event_rx = event_rx.lock().await;
         select! {
           _ = canceller.cancelled() => {
+            state.lock().await.excluded_key_events = vec!();
             cancel_tx.send(()).unwrap();
             break;
           },
@@ -114,12 +126,18 @@ impl BtspeakKeyInterceptor for MyServer {
                 match tx.send(Ok(event)).await {
                   Ok(_) => {},
                   _ => {
+                    let mut state = state.lock().await;
+                    state.sending_key_events = false;
+                    state.excluded_key_events = vec!();
                     event_sender.lock().await.set(None);
                     break;
                   },
                 };
               },
               None => {
+                let mut state = state.lock().await;
+                state.sending_key_events = false;
+                state.excluded_key_events = vec!();
                 event_sender.lock().await.set(None);
                 break;
               },
@@ -131,15 +149,52 @@ impl BtspeakKeyInterceptor for MyServer {
     Ok(Response::new(ReceiverStream::new(rx)))
   }
   async fn set_excluded_key_combinations(&self, request: Request<BrailleKeyCombinations>) -> Result<Response<Empty>, Status> {
+    let mut state = self.state.lock().await;
+    if !state.sending_key_combinations {
+      return Err(Status::failed_precondition("Not currently sending key combinations"));
+    };
+    let combinations = request
+      .into_inner()
+      .combinations
+      .into_iter()
+      .map(|combination| {
+        let dots = KeyFlags::from_bits_truncate(combination.dots as u16);
+        if combination.space {
+          dots | KeyFlags::Space
+        }
+        else {
+          dots
+        }
+      })
+      .collect::<Vec<KeyFlags>>();
+    state.excluded_key_combinations = combinations;
     let reply = Empty {};
     Ok(Response::new(reply))
   }
   async fn set_excluded_key_events(&self, request: Request<BrailleKeyEvents>) -> Result<Response<Empty>, Status> {
+    let mut state = self.state.lock().await;
+    if !state.sending_key_events {
+      return Err(Status::failed_precondition("Not currently sending key events"));
+    };
+    let events = request
+      .into_inner()
+      .events
+      .into_iter()
+      .map(|event| {
+        let dot = KeyFlags::from_bits_truncate(event.dot as u16);
+        (dot, event.release)
+      })
+      .collect::<Vec<(KeyFlags, bool)>>();
+    state.excluded_key_events = events;
     let reply = Empty {};
     Ok(Response::new(reply))
   }
   async fn release_keyboard(&self, _request: Request<Empty>) -> Result<Response<Empty>, Status> {
-    let mut state = self.state.lock().await;
+    {
+      let mut state = self.state.lock().await;
+      state.sending_key_combinations = false;
+      state.sending_key_events = false;
+    };
     let combination_sender = self.combination_sender.lock().await;
     let event_sender = self.event_sender.lock().await;
     if let Some((canceller, cancel_rx)) = combination_sender.take() {
@@ -150,14 +205,18 @@ impl BtspeakKeyInterceptor for MyServer {
       canceller.cancel();
       cancel_rx.await.unwrap();
     };
-    state.sending_key_combinations = false;
-    state.sending_key_events = false;
     let reply = Empty {};
     Ok(Response::new(reply))
   }
   async fn send_key_combination(&self, request: Request<BrailleKeyCombination>) -> Result<Response<Empty>, Status> {
     let combination = request.into_inner();
-    let combination = KeyFlags::from_bits_truncate(combination.dots as u16);
+    let dots = KeyFlags::from_bits_truncate(combination.dots as u16);
+    let combination = if combination.space {
+      dots | KeyFlags::Space
+    }
+    else {
+      dots
+    };
     self.combination_tx.send(combination).await.unwrap();
     let reply = Empty {};
     Ok(Response::new(reply))
@@ -202,7 +261,12 @@ async fn main() {
   let virtual_device = Arc::new(Mutex::new(virtual_device));
   let virtual_device2 = virtual_device.clone();
   let mut event_stream = device.into_event_stream().unwrap();
-  let state = Arc::new(Mutex::new(State { sending_key_combinations: false, sending_key_events: false }));
+  let state = Arc::new(Mutex::new(State {
+    sending_key_combinations: false,
+    sending_key_events: false,
+    excluded_key_combinations: vec!(),
+    excluded_key_events: vec!(),
+  }));
   let state2 = state.clone();
   let (combination_tx, combination_rx) = mpsc::channel(32);
   let (event_tx, event_rx) = mpsc::channel(32);
@@ -227,26 +291,46 @@ async fn main() {
             KeyCode::KEY_SPACE => KeyFlags::Space,
             _ => KeyFlags::empty(),
           };
-          match value {
-            0 => held_keys -= flag.clone(),
-            _ => {
-              pressed_keys |= flag.clone();
-              held_keys |= flag.clone();
-            },
-          };
           let state = state.lock().await;
-          if held_keys==KeyFlags::empty() {
-            if state.sending_key_combinations && pressed_keys!=KeyFlags::empty() {
-              combination_tx.send(pressed_keys.clone()).await.unwrap();
-            };
-            pressed_keys.clear();
-          };
-          if state.sending_key_events {
-            let released = value==0;
-            event_tx.send((flag.clone(), released)).await.unwrap();
-          };
-          if !state.sending_key_combinations && !state.sending_key_events {
+          if state.sending_key_events && state.excluded_key_events.contains(&(flag.clone(), value==0)) {
             virtual_device.lock().await.emit(&[event]).unwrap();
+          }
+          else {
+            match value {
+              0 => held_keys -= flag.clone(),
+              _ => {
+                pressed_keys |= flag.clone();
+                held_keys |= flag.clone();
+              },
+            };
+            if held_keys==KeyFlags::empty() {
+              if state.sending_key_combinations && pressed_keys!=KeyFlags::empty() {
+                if state.excluded_key_combinations.contains(&pressed_keys) {
+                  let codes = pressed_keys
+                    .iter()
+                    .map(|flag| key_flag_to_key_code(flag))
+                    .collect::<Vec<KeyCode>>();
+                  let mut virtual_device = virtual_device.lock().await;
+                  for code in codes.clone() {
+                    virtual_device.emit(&[KeyEvent::new(code, 1).into()]).unwrap();
+                  };
+                  for code in codes {
+                    virtual_device.emit(&[KeyEvent::new(code, 0).into()]).unwrap();
+                  };
+                }
+                else {
+                  combination_tx.send(pressed_keys.clone()).await.unwrap();
+                };
+              };
+              pressed_keys.clear();
+            };
+            if state.sending_key_events {
+              let released = value==0;
+              event_tx.send((flag.clone(), released)).await.unwrap();
+            };
+            if !state.sending_key_combinations && !state.sending_key_events {
+              virtual_device.lock().await.emit(&[event]).unwrap();
+            };
           };
         },
         _ => {}
