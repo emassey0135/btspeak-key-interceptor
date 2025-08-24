@@ -48,8 +48,12 @@ struct MyServer {
 impl BtspeakKeyInterceptor for MyServer {
   type GrabKeyCombinationsStream = ReceiverStream<Result<BrailleKeyCombination, Status>>;
   async fn grab_key_combinations(&self, _request: Request<Empty>) -> Result<Response<Self::GrabKeyCombinationsStream>, Status> {
+    let mut state = self.state.lock().await;
+    if state.sending_key_combinations {
+      return Err(Status::failed_precondition("Already sending key combinations"));
+    };
     let combination_sender = self.combination_sender.lock().await;
-    self.state.lock().await.sending_key_combinations = true;
+    state.sending_key_combinations = true;
     let (tx, rx) = mpsc::channel(32);
     let combination_rx = self.combination_rx.clone();
     let canceller = CancellationToken::new();
@@ -99,8 +103,12 @@ impl BtspeakKeyInterceptor for MyServer {
   }
   type GrabKeyEventsStream = ReceiverStream<Result<BrailleKeyEvent, Status>>;
   async fn grab_key_events(&self, _request: Request<Empty>) -> Result<Response<Self::GrabKeyEventsStream>, Status> {
+    let mut state = self.state.lock().await;
+    if state.sending_key_events {
+      return Err(Status::failed_precondition("Already sending key events"));
+    };
     let event_sender = self.event_sender.lock().await;
-    self.state.lock().await.sending_key_events = true;
+    state.sending_key_events = true;
     let (tx, rx) = mpsc::channel(32);
     let event_rx = self.event_rx.clone();
     let canceller = CancellationToken::new();
@@ -181,7 +189,7 @@ impl BtspeakKeyInterceptor for MyServer {
       .events
       .into_iter()
       .map(|event| {
-        let dot = KeyFlags::from_bits_truncate(event.dot as u16);
+        let dot = KeyFlags::from_bits_truncate(2_u32.pow((event.dot-1) as u32) as u16);
         (dot, event.release)
       })
       .collect::<Vec<(KeyFlags, bool)>>();
@@ -223,7 +231,7 @@ impl BtspeakKeyInterceptor for MyServer {
   }
   async fn send_key_event(&self, request: Request<BrailleKeyEvent>) -> Result<Response<Empty>, Status> {
     let event = request.into_inner();
-    let key = KeyFlags::from_bits_truncate(event.dot as u16);
+    let key = KeyFlags::from_bits_truncate(2_u32.pow((event.dot-1) as u32) as u16);
     let event = (key, event.release);
     self.event_tx.send(event).await.unwrap();
     let reply = Empty {};
