@@ -1,0 +1,13 @@
+[Unit]
+Description=Key interceptor to allow other applications to receive keys from the Bt Speak keyboard
+Wants=network.target
+After=network.target
+Before=brltty@-etc-brltty_btspeak.conf.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/btspeak-key-interceptor
+Restart=always
+
+[Install]
+WantedBy=brltty@btspeak.path
