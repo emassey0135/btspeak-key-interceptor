@@ -129,6 +129,7 @@ impl BtspeakKeyInterceptor for MyServer {
             match result {
               Some(event) => {
                 let dot = event.0.bits();
+                let dot = (dot as f64).log2()+1.0;
                 let release = event.1;
                 let event = BrailleKeyEvent { dot: dot as i32, release };
                 match tx.send(Ok(event)).await {
@@ -286,7 +287,6 @@ async fn main() {
     while let Ok(event) = event_stream.next_event().await {
       match event.destructure() {
         EventSummary::Key(_, code, value) => {
-          println!("Key {:?}, value {}", code, value);
           let flag = match code {
             KeyCode::KEY_BRL_DOT1 => KeyFlags::Dot1,
             KeyCode::KEY_BRL_DOT2 => KeyFlags::Dot2,
